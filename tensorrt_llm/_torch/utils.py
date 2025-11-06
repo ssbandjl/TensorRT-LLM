@@ -7,10 +7,12 @@ from typing import Dict, List
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
+is_piecewise_running_flag = False
 
 aux_stream_name_list = [
     'Attention',
@@ -37,6 +39,16 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+def set_piecewise_running(enable: bool):
+    global is_piecewise_running_flag
+    is_piecewise_running_flag = enable
+
+
+def is_piecewise_running() -> bool:
+    global is_piecewise_running_flag
+    return is_piecewise_running_flag
 
 
 _global_attrs = threading.local()
@@ -80,7 +92,8 @@ def make_weak_ref(x):
 
     if isinstance(x, torch.Tensor):
         return convert_to_torch_tensor(
-            TensorWrapper(x.data_ptr(), x.dtype, x.shape)) if x.is_cuda else x
+            TensorWrapper(x.data_ptr(), x.dtype, x.shape,
+                          x.stride())) if x.is_cuda else x
     elif isinstance(x, tuple):
         return tuple(make_weak_ref(i) for i in x)
     elif isinstance(x, list):
@@ -275,3 +288,40 @@ def piecewise_cuda_graph(enable: bool):
         yield
     finally:
         set_piecewise_cuda_graph_flag(prev_enable)
+
+
+def set_per_request_piecewise_cuda_graph_flag(enable: bool):
+    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+
+
+def get_per_request_piecewise_cuda_graph_flag() -> bool:
+    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+
+
+def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
+    # We use heuristic to determine the lm_head_tp_size
+    # Since token_count=256 will hit the boundary of math-bound problem
+    # We use 256 // token_count to determine the lm_head_tp_size
+    lm_head_tp_size_raw = 256 // token_count
+    lm_head_tp_size = nearest_in_buckets(lm_head_tp_size_raw,
+                                         [1, mapping.gpus_per_node])
+    assert mapping.tp_size % lm_head_tp_size == 0
+    lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
+
+    return Mapping(
+        world_size=lm_head_tp_size * lm_head_pp_size,
+        rank=mapping.rank,
+        gpus_per_node=mapping.gpus_per_node,
+        tp_size=lm_head_tp_size,
+        pp_size=lm_head_pp_size,
+        enable_attention_dp=mapping.enable_attention_dp,
+        enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
+    )
+
+
+def get_device_uuid(device_idx: int) -> str:
+    """Get the UUID of a CUDA device using torch cuda api"""
+
+    property = torch.cuda.get_device_properties(device_idx)
+    uuid = "GPU-" + str(property.uuid)
+    return uuid

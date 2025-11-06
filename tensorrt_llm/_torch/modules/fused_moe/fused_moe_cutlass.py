@@ -5,13 +5,13 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
-from tensorrt_llm.math_utils import pad_up
+from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div,
-                      swizzle_sf)
-from .interface import MoE
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
+from .interface import AlltoallMethodType, MoE
 
 # isort: off
 from .quantization import (
@@ -87,15 +87,17 @@ class CutlassFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            layer_idx=layer_idx,
         )
+
+        # Store original hidden size before any potential padding
+        self.unpadded_hidden_size = self.hidden_size
 
         if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         ):
             self.hidden_size = ((self.hidden_size + 127) // 128) * 128
             self.intermediate_size_per_partition = (
                 (self.intermediate_size_per_partition + 127) // 128) * 128
-
-        self.layer_idx = layer_idx
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -139,19 +141,51 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled_min_latency = False
 
         # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
+        self.alltoall_method_type = self.select_alltoall_method_type()
+        logger.info_once(
+            f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
+            key="alltoall_method_type")
         self.alltoall_workspace = None
         self.alltoall_prepare_workspace = None
+        self.use_low_precision_combine = False
         if self.enable_alltoall:
-            MnnvlMemory.initialize()
-            self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                model_config.mapping)
-            self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                model_config.mapping)
+            self.use_low_precision_combine = model_config.use_low_precision_moe_combine
+
+            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                if self.moe_alltoall_backend == "mnnvllatency":
+                    MnnvlMemory.initialize()
+                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                        model_config.mapping)
+                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                        model_config.mapping)
+                elif self.moe_alltoall_backend == "mnnvlthroughput":
+                    workspace_mb = int(
+                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
+                    self.moe_a2a = MoeAlltoAll(
+                        mapping=self.mapping,
+                        max_num_tokens=model_config.max_num_tokens,
+                        top_k=self.routing_method.experts_per_token,
+                        num_experts=self.num_experts,
+                        workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                    )
+            elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+                raise NotImplementedError(
+                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                )
+            else:
+                raise NotImplementedError(
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                )
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
+        # Finalize fusion should be disabled if Lora is used.
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -187,15 +221,44 @@ class CutlassFusedMoE(MoE):
         return self.quant_config.layer_quant_mode.is_int8_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
+    def select_alltoall_method_type(self) -> AlltoallMethodType:
+        all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        if all2all_method_type is not None:
+            if AlltoallMethodType[all2all_method_type] in [
+                    AlltoallMethodType.DeepEP,
+                    AlltoallMethodType.DeepEPLowLatency
+            ]:
+                raise NotImplementedError(
+                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                )
+            return AlltoallMethodType[all2all_method_type]
+
+        if not self.mapping.enable_attention_dp:
+            return AlltoallMethodType.NotEnabled
+
+        if self.mapping.tp_size == 1:
+            return AlltoallMethodType.NotEnabled
+
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
+            return AlltoallMethodType.NotEnabled
+
+        if not (self.mapping.moe_ep_size > self.routing_method.experts_per_token
+                and MnnvlMemory.supports_mnnvl()):
+            return AlltoallMethodType.NotEnabled
+
+        return AlltoallMethodType.MNNVL
+
     @cached_property
     def enable_alltoall(self):
-        return (self.mapping.moe_ep_size > self.routing_method.experts_per_token
-                and self.routing_method.experts_per_token % 4 ==
-                0  # alltoall without allgather only supports top_k % 4 == 0
-                and self.mapping.enable_attention_dp
-                and self.mapping.tp_size > 1
-                and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"
-                and MnnvlMemory.supports_mnnvl())
+        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+        """
+        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
+
+    @cached_property
+    def moe_alltoall_backend(self):
+        # "mnnvllatency" (default) or "mnnvlthroughput"
+        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
+                              "mnnvllatency").strip().lower()
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -285,7 +348,6 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 pad_size = self.hidden_size - x.shape[1]
-                original_hidden_size = x.shape[1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
                 use_w4_group_scaling = True
                 weight_dtype = torch.uint8
@@ -341,11 +403,12 @@ class CutlassFusedMoE(MoE):
         # Alltoall or allgather for attention DP
         token_count = x.shape[0]
         alltoall_info = None  # Store for later combine
+        is_sf_swizzled = True  # In case of post-quant communication, scaling factors will not be swizzled before communication, and swizzling after communication is merged into MoE.
         if self.enable_alltoall:
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
             # Prepare alltoall indices
             top_k = self.routing_method.experts_per_token
-            max_num_token = max(
+            runtime_max_tokens_per_rank = max(
                 all_rank_num_tokens) if all_rank_num_tokens else token_count
 
             # Handle case where token_final_scales might be None (when apply_router_weight_on_input=True)
@@ -353,40 +416,70 @@ class CutlassFusedMoE(MoE):
                 token_final_scales = torch.ones_like(token_selected_experts,
                                                      dtype=torch.float32)
 
-            # TODO: support alltoall without allgather for top_k % 4 != 0
-            assert top_k % 4 == 0, "alltoall without allgather only supports top_k % 4 == 0"
-            assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
-            alltoall_info, token_selected_experts, token_final_scales, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
-                token_selected_experts, token_final_scales, None,
-                self.alltoall_prepare_workspace, max_num_token, self.ep_rank,
-                self.ep_size, self.num_experts, self.num_experts, top_k)
+            if self.moe_alltoall_backend == "mnnvllatency":
+                assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
+                alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                    token_selected_experts, None,
+                    self.alltoall_prepare_workspace,
+                    runtime_max_tokens_per_rank, self.ep_rank, self.ep_size,
+                    self.num_experts, self.num_experts, top_k)
 
-            # Dispatch alltoall (common for both paths)
-            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
-                                             self.alltoall_workspace,
-                                             self.ep_rank, self.ep_size)
-            if x_sf is not None:
-                x_sf = x_sf.view(x_row, ceil_div(x_col,
-                                                 self.scaling_vector_size))
+                if x_sf is not None:
+                    x_sf = x_sf.view(x_row,
+                                     ceil_div(x_col, self.scaling_vector_size))
+                    is_sf_swizzled = False
 
-                # Pad dim[1] to 16 bytes alignment for alltoall
-                # TODO: Remove this padding if possible
-                sf_per_16bytes = 16 // x_sf.element_size()
-                x_sf_col_orig = x_sf.shape[1]
-                x_sf_col = pad_up(x_sf_col_orig, sf_per_16bytes)
-                if x_sf_col > x_sf_col_orig:
-                    x_sf = torch.nn.functional.pad(
-                        x_sf, (0, x_sf_col - x_sf_col_orig))
+                # Dispatch x, x_sf, token_selected_experts, token_final_scales in one alltoall kernel
+                x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+                    [x, x_sf, token_selected_experts, token_final_scales],
+                    alltoall_info, self.alltoall_workspace, self.ep_rank,
+                    self.ep_size)
 
-                x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
-                                                    self.alltoall_workspace,
-                                                    self.ep_rank, self.ep_size)
-                x_row = x_sf.shape[0]
+                torch.ops.trtllm.memset_expert_ids(
+                    token_selected_experts,
+                    alltoall_info.recv_rank_count_cumsum,
+                    runtime_max_tokens_per_rank, top_k, self.num_experts,
+                    self.ep_size)
+            elif self.moe_alltoall_backend == "mnnvlthroughput":
+                # Python MoeAlltoAll path
+                if x_sf is not None:
+                    x_sf = x_sf.view(x_row,
+                                     ceil_div(x_col, self.scaling_vector_size))
+                    is_sf_swizzled = False
 
-                # TODO: Remove this slicing required by padding if possible
-                x_sf = x_sf[:, :x_sf_col_orig].contiguous()
+                payloads = []
+                payloads.append(x)
+                if x_sf is not None:
+                    payloads.append(x_sf)
+                    expert_id_payload_index = 2
+                else:
+                    expert_id_payload_index = 1
+                payloads.append(token_selected_experts)
+                payloads.append(token_final_scales)
 
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
+                recv_tensors = self.moe_a2a.dispatch(
+                    token_selected_experts,
+                    payloads,
+                    runtime_max_tokens_per_rank,
+                    invalid_token_expert_id=self.
+                    num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
+                    expert_id_payload_index=expert_id_payload_index,
+                )
+
+                if x_sf is not None:
+                    x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors
+                    x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
+                else:
+                    x_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors
+                x = x_recv.view(-1, x_recv.shape[-1])
+                token_selected_experts = token_selected_experts_recv.view(
+                    -1, token_selected_experts_recv.shape[-1])
+                token_final_scales = token_final_scales_recv.view(
+                    -1, token_final_scales_recv.shape[-1])
+            else:
+                raise ValueError(
+                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                )
 
         elif run_post_quant_allgather:
             # Original allgather logic
@@ -396,16 +489,24 @@ class CutlassFusedMoE(MoE):
                 assert len(
                     x_sf.shape
                 ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
+                is_sf_swizzled = False
+
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
-            # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
+        # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
+        moe_output: Optional[torch.Tensor] = None
+        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput":
+            # Retrieve a workspace-backed output tensor sized by runtime tokens
+            runtime_max_tokens_per_rank = max(
+                all_rank_num_tokens) if all_rank_num_tokens else x.shape[0]
+            moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
+                runtime_max_tokens_per_rank, self.unpadded_hidden_size,
+                output_dtype)
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
@@ -417,7 +518,7 @@ class CutlassFusedMoE(MoE):
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
-            swizzled_input_sf=True,
+            swizzled_input_sf=is_sf_swizzled,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
@@ -437,31 +538,43 @@ class CutlassFusedMoE(MoE):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
+            unpadded_hidden_size=self.unpadded_hidden_size,
+            out_tensor=moe_output,
         )
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
-        # TODO: Fuse this for padded MXFP4.
-        final_hidden_states = final_hidden_states[:, :self.
-                                                  hidden_size].contiguous()
-
-        if self.has_w4a16_mxfp4:
-            final_hidden_states = final_hidden_states[:, :
-                                                      original_hidden_size].contiguous(
-                                                      )
 
         # Combine results if using alltoall
-        if self.enable_alltoall and alltoall_info is not None:
-            top_k = self.routing_method.experts_per_token
-            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
-                final_hidden_states,
-                alltoall_info,
-                self.alltoall_workspace,
-                ep_rank=self.ep_rank,
-                ep_size=self.ep_size,
-                top_k=top_k,
-                token_count=token_count)
+        if self.enable_alltoall:
+            if self.moe_alltoall_backend == "mnnvllatency":
+                if alltoall_info is not None:
+                    top_k = self.routing_method.experts_per_token
+                    final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                        final_hidden_states,
+                        alltoall_info,
+                        self.alltoall_workspace,
+                        ep_rank=self.ep_rank,
+                        ep_size=self.ep_size,
+                        top_k=top_k,
+                        use_low_precision_combine=self.
+                        use_low_precision_combine,
+                        token_count=token_count)
+            elif self.moe_alltoall_backend == "mnnvlthroughput":
+                output_hidden_size = final_hidden_states.shape[-1]
+                runtime_max_tokens_per_rank = max(
+                    all_rank_num_tokens) if all_rank_num_tokens else token_count
+                final_hidden_states = self.moe_a2a.combine(
+                    final_hidden_states.view(self.ep_size,
+                                             runtime_max_tokens_per_rank,
+                                             output_hidden_size),
+                    runtime_max_tokens_per_rank,
+                    payload_in_workspace=True)
+            else:
+                raise ValueError(
+                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                )
 
         return final_hidden_states
 
@@ -472,15 +585,16 @@ class CutlassFusedMoE(MoE):
             split_num_chunks - val_mod)
         return split_chunk_size_list
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp and self.parallel_size > 1:
@@ -490,15 +604,16 @@ class CutlassFusedMoE(MoE):
         else:
             num_rows = x.shape[0]
 
+        if use_dp_padding:
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
+                                          ] * len(all_rank_num_tokens)
+            num_rows = sum(all_rank_num_tokens_padded)
+        else:
+            all_rank_num_tokens_padded = all_rank_num_tokens
+
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
-
-        if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens
-                                          ] * len(all_rank_num_tokens)
-        else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
 
         if num_chunks == 1:
             outputs = self.forward_chunk(
@@ -583,9 +698,43 @@ class CutlassFusedMoE(MoE):
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs
 
+    def forward_fake(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        if not self.enable_alltoall:
+            return super().forward_fake(
+                x,
+                router_logits,
+                do_finalize=do_finalize,
+                output_dtype=output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=use_dp_padding,
+                **kwargs,
+            )
+        else:
+            is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
+            data_type = output_dtype if is_nvfp4_input else x.dtype
+            num_tokens = all_rank_num_tokens[
+                self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
+            hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
+            top_k = self.routing_method.experts_per_token
+            return x.new_empty((num_tokens, top_k, hidden_size),
+                               dtype=data_type)
+
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)

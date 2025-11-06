@@ -143,6 +143,7 @@ def remove_weights(
     for mod in iter_modules(module, ignore_modules):
         mod._parameters.clear()
         mod._buffers.clear()
+        mod._weights_removed = True
 
 
 def skip_forward(
@@ -352,7 +353,7 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
-        if config.mapping.enable_attention_dp:
+        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
@@ -379,6 +380,8 @@ class DecoderModelForCausalLM(nn.Module,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
+                                             False),
             )
 
             if self.has_custom_lm_head:
@@ -482,8 +485,27 @@ class DecoderModelForCausalLM(nn.Module,
         if quant_config is not None:
             if quant_config.exclude_modules is not None:
                 for name, module in self.named_modules():
-                    is_excluded = quant_config.is_module_excluded_from_quantization(
-                        name)
+                    candidates = [name]
+                    if isinstance(module, Linear):
+                        weight_mode = module.weights_loading_config.weight_mode
+                        if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                            # sometimes gate and up proj are not packed in the checkpoint,
+                            # but they still share the same exclusion rule
+                            candidates += [
+                                name.replace('gate_up_proj', 'gate_proj'),
+                                name.replace('gate_up_proj', 'up_proj')
+                            ]
+                        elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                            # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
+                            # but they still share the same exclusion rule
+                            candidates += [
+                                name.replace('qkv_proj', 'q_proj'),
+                                name.replace('qkv_proj', 'k_proj'),
+                                name.replace('qkv_proj', 'v_proj')
+                            ]
+                    is_excluded = any(
+                        quant_config.is_module_excluded_from_quantization(n)
+                        for n in candidates)
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
@@ -849,6 +871,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 for new_name in params_map[names[-1]]:
                     fw = filter_weights('.'.join(names[:-1] + [new_name]),
                                         weights)
+                    if not fw:
+                        continue
                     if new_name in ['k_proj', 'v_proj']:
                         num_kv_heads_list = [num_kv_heads
                                              ] * len(fw) if isinstance(
@@ -865,23 +889,29 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                         }
 
                     module_weights.append(fw)
-                module.load_weights(weights=module_weights)
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
+                if module_weights:
+                    module.load_weights(weights=module_weights)
+
             else:
                 module_weights = filter_weights(name, weights)
-                if hasattr(module, 'load_weights'):
-                    module.load_weights(weights=[module_weights])
-                else:
-                    for n, p in module._parameters.items():
-                        if p is not None:
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
+                if module_weights:
+                    if hasattr(module, 'load_weights'):
+                        module.load_weights(weights=[module_weights])
+                    else:
+                        for n, p in module.named_parameters(recurse=False):
                             p.data.copy_(module_weights[n][:])
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      False) in ["True", "true", "1", "yes", "y"]:
-        for name, module in tqdm(list(model.named_modules()),
+                      "True") in ["True", "true", "1", "yes", "y"]:
+        for name, module in tqdm(list(
+                model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
-        all_modules = dict(model.named_modules())
+        # remove_duplicate=False ensures original modules sharing weights with next_layer_layernorm are not skipped
+        all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []
         if preload_weight_modules is not None:
             for module in preload_weight_modules:
@@ -897,10 +927,13 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 del all_modules[module]
             pbar.close()
 
-        pbar = tqdm(list(model.named_modules()),
+        pbar = tqdm(list(model.named_modules(remove_duplicate=False)),
                     desc="Loading weights concurrently")
-        args_list = [(name, module) for name, module in model.named_modules()
-                     if name not in serial_load_modules]
+        args_list = [
+            (name, module)
+            for name, module in model.named_modules(remove_duplicate=False)
+            if name not in serial_load_modules
+        ]
         run_concurrently(load_single_module, args_list, pbar=pbar)
 
 
@@ -928,28 +961,36 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             if weight_mapper.does_require_special_handling(module_name):
                 module_weights = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
-                module.load_weights(weights=module_weights)
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
+                if module_weights:
+                    module.load_weights(weights=module_weights)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
-                if weight_mapper.is_special_instance_module(module):
-                    weight_mapper.handle_special_instance_module(
-                        module, module_name, module_weights)
-
-                elif hasattr(module, 'load_weights'):
-                    module.load_weights(weights=[module_weights])
-                else:
-                    for n, p in module._parameters.items():
-                        if p is not None:
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
+                if module_weights:
+                    if weight_mapper.is_special_instance_module(module):
+                        weight_mapper.handle_special_instance_module(
+                            module, module_name, module_weights)
+                    elif hasattr(module, 'load_weights'):
+                        if module_weights:
+                            if "linear_attn.conv1d" in name:
+                                module_weights['weight'] = module_weights[
+                                    'weight'].squeeze(dim=1)
+                            module.load_weights(weights=[module_weights])
+                    else:
+                        for n, p in module.named_parameters(recurse=False):
                             weight_mapper.handle_manual_copy(
                                 module_name, module_weights, n, p)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      False) in ["True", "true", "1", "yes", "y"]:
-        for name, module in tqdm(list(model.named_modules()),
+                      "True") in ["True", "true", "1", "yes", "y"]:
+        for name, module in tqdm(list(
+                model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
-        all_modules = dict(model.named_modules())
+        # remove_duplicate=False ensures original modules sharing weights with next_layer_layernorm are not skipped
+        all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []
         if preload_weight_modules is not None:
             for module in preload_weight_modules:
@@ -965,8 +1006,11 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                 del all_modules[module]
             pbar.close()
 
-        pbar = tqdm(list(model.named_modules()),
+        pbar = tqdm(list(model.named_modules(remove_duplicate=False)),
                     desc="Loading weights concurrently")
-        args_list = [(name, module) for name, module in model.named_modules()
-                     if name not in serial_load_modules]
+        args_list = [
+            (name, module)
+            for name, module in model.named_modules(remove_duplicate=False)
+            if name not in serial_load_modules
+        ]
         run_concurrently(load_single_module, args_list, pbar=pbar)

@@ -476,7 +476,7 @@ def per_token_quant_and_transform(
     scale_k = ceil_div(k, quant_group_size)
     m_padded = align(m, alignment)
     scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.zeros((scale_k_padded // 4, m_padded),
+    output_scale = torch.empty((scale_k_padded // 4, m_padded),
                                dtype=torch.int32,
                                device='cuda')
 
@@ -518,3 +518,16 @@ def per_token_quant_and_transform(
         tma_stride_check=True,
     )
     return output, output_scale
+
+
+def fp8_quantize_1x128_sf_transpose(
+        x: torch.Tensor,
+        use_ue8m0: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=use_ue8m0)
+    if x_scale.ndim == 1:  # Handle SM version differences (SM90: 1D padded, SM100+: 2D)
+        x_padded = (x.shape[0] + 3) // 4 * 4
+        num_blocks = (x.shape[1] + 127) // 128
+        x_scale = x_scale[:x_padded * num_blocks].view(num_blocks,
+                                                       x_padded)[:, :x.shape[0]]
+    x_scale = x_scale.contiguous().transpose(0, 1)
+    return x_fp8, x_scale
